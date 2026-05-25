@@ -6,8 +6,7 @@ A Cobalt Strike Beacon Object File (BOF) implementation of the MS16-032 local pr
 
 MS16-032 exploits a race condition in the Windows Secondary Logon Service to obtain a SYSTEM token. This BOF provides two variants:
 
-1. **ms16032** - Execute arbitrary commands as SYSTEM
-2. **ms16032_inject** - Automatically inject a new Cobalt Strike beacon running as SYSTEM (recommended)
+ **ms16032_inject** - Automatically inject a new Cobalt Strike beacon running as SYSTEM (recommended)
 
 ## Vulnerable Systems
 
@@ -39,11 +38,9 @@ MS16-032 exploits a race condition in the Windows Secondary Logon Service to obt
 
 ```bash
 # Compile x64 version
-x86_64-w64-mingw32-gcc -c ms16032.c -o ms16032.x64.o -masm=intel
 x86_64-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x64.o -masm=intel
 
 # Compile x86 version
-i686-w64-mingw32-gcc -c ms16032.c -o ms16032.x86.o -masm=intel
 i686-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x86.o -masm=intel
 ```
 
@@ -114,11 +111,10 @@ You can modify the injection target in `ms16032_inject.c` (line 233):
 
 ```c
 // Current default
-wchar_t target[] = L"C:\\Windows\\System32\\notepad.exe";
+wchar_t target[] = L"C:\\Windows\\System32\\dllhost.exe";
 
 // Alternative options:
 // wchar_t target[] = L"C:\\Windows\\System32\\RuntimeBroker.exe";
-// wchar_t target[] = L"C:\\Windows\\System32\\dllhost.exe";
 // wchar_t target[] = L"C:\\Windows\\System32\\svchost.exe";
 ```
 ## How It Works
