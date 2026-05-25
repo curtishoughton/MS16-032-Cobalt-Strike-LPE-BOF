@@ -4,7 +4,7 @@ A Cobalt Strike Beacon Object File (BOF) implementation of the MS16-032 local pr
 
 ## Overview
 
-MS16-032 exploits a race condition in the Windows Secondary Logon Service to obtain a SYSTEM token. This BOF provides two variants:
+MS16-032 exploits a race condition in the Windows Secondary Logon Service to obtain a SYSTEM token:
 
  **ms16032_inject** - Automatically inject a new Cobalt Strike beacon running as SYSTEM (recommended)
 
