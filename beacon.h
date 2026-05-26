@@ -1,56 +1,11 @@
 #pragma once
 
 #include <windows.h>
-#include <winnt.h>
 
 /* Callback output types */
 #define CALLBACK_OUTPUT       0x0
 #define CALLBACK_ERROR        0x0d
 #define CALLBACK_OUTPUT_UTF8  0x20
-
-/* Token information class */
-typedef enum _TOKEN_INFORMATION_CLASS {
-    TokenUser = 1,
-    TokenGroups,
-    TokenPrivileges,
-    TokenOwner,
-    TokenPrimaryGroup,
-    TokenDefaultDacl,
-    TokenSource,
-    TokenType,
-    TokenImpersonationLevel,
-    TokenStatistics,
-    TokenRestrictedSids,
-    TokenSessionId,
-    TokenGroupsAndPrivileges,
-    TokenSessionReference,
-    TokenSandBoxInert,
-    TokenAuditPolicy,
-    TokenOrigin,
-    TokenElevationType,
-    TokenLinkedToken,
-    TokenElevation,
-    TokenHasRestrictions,
-    TokenAccessInformation,
-    TokenVirtualizationAllowed,
-    TokenVirtualizationEnabled,
-    TokenIntegrityLevel,
-    TokenUIAccess,
-    TokenMandatoryPolicy,
-    TokenLogonSid,
-    MaxTokenInfoClass
-} TOKEN_INFORMATION_CLASS, *PTOKEN_INFORMATION_CLASS;
-
-/* Token type */
-typedef enum _TOKEN_TYPE {
-    TokenPrimary = 1,
-    TokenImpersonation
-} TOKEN_TYPE, *PTOKEN_TYPE;
-
-/* Token user structure */
-typedef struct _TOKEN_USER {
-    SID_AND_ATTRIBUTES User;
-} TOKEN_USER, *PTOKEN_USER;
 
 /* Beacon data parser structure */
 typedef struct {
@@ -97,4 +52,3 @@ DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI ADVAPI32$ConvertSidToStringSidW(PSID, LPW
 DECLSPEC_IMPORT WINBASEAPI BOOL WINAPI ADVAPI32$CreateProcessAsUserW(HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
 
 #endif
-
