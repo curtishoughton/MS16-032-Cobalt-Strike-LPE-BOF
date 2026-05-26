@@ -47,9 +47,7 @@ i686-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x86.o -masm=intel
 ### Loading into Cobalt Strike
 
 1. Place all files in the same directory:
-   - `ms16032.x64.o` / `ms16032.x86.o`
    - `ms16032_inject.x64.o` / `ms16032_inject.x86.o`
-   - `ms16032.cna`
    - `ms16032_inject.cna` (or combined script)
    - `beacon.h`
 
