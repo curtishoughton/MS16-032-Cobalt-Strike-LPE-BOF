@@ -1,55 +1,54 @@
 # MS16-032 Beacon Object File (BOF)
 
-A Cobalt Strike BOF implementing the MS16-032 local privilege escalation exploit (CVE-2016-0099) with direct beacon injection via Early Bird APC.
+A Cobalt Strike Beacon Object File (BOF) implementation of the MS16-032 local privilege escalation exploit (CVE-2016-0099) with direct beacon injection.
 
 ## Overview
 
-MS16-032 exploits a race condition in the Windows Secondary Logon Service (`seclogon`) to leak a SYSTEM token handle into the calling process. The BOF then uses that token to spawn a sacrificial process as SYSTEM and injects beacon shellcode via APC — no files touch disk.
+MS16-032 exploits a race condition in the Windows Secondary Logon Service (`seclogon`) to obtain a SYSTEM token and inject a new beacon.
 
 ## Vulnerable Systems
 
-- Windows 7 (all editions)
-- Windows 8 / 8.1 (all editions)
+- Windows 7 (all versions)
+- Windows 8 / 8.1 (all versions)
 - Windows 10 (pre-patch)
 - Windows Server 2008 / 2008 R2
 - Windows Server 2012 / 2012 R2
 
-Systems must be **unpatched** (before KB3139914, March 2016).
+**Note:** Systems must be unpatched (before KB3139914, March 2016). Requires 2+ logical processors.
 
 ## Features
 
 - Pure BOF implementation (no CRT dependencies)
-- Correct exploit chain: baseline/diff handle snapshots to detect leaked SYSTEM tokens
-- Dynamic token object type index resolution (works across all Windows builds)
-- Event-based clean thread shutdown (no `TerminateThread`)
-- Full token validation: type, SID, integrity level
-- RW -> RX memory protection (no RWX allocations)
-- Early Bird APC injection (no `CreateRemoteThread`)
-- CPU count pre-flight check (requires 2+ logical processors)
+- Correct MS16-032 race condition exploitation
+- Direct beacon injection via Early Bird APC (no `CreateRemoteThread`)
+- RW->RX memory protection (no RWX allocations)
+- Clean thread shutdown via interlocked flags (no `TerminateThread`)
+- Full token validation (type, SID, integrity level)
+- Dual process creation fallback (`CreateProcessWithTokenW` / impersonation)
+- CPU count pre-flight check
 - Retry loop with configurable attempts
-- Dual process creation fallback (`CreateProcessWithTokenW` / `CreateProcessAsUserW`)
-- Supports both x86 and x64 architectures (WOW64-safe)
-
-## Requirements
-
-- Cobalt Strike 4.0+
-- MinGW-w64 cross-compiler (or Visual Studio with appropriate flags)
-- `SeImpersonatePrivilege` on the beacon process (service accounts, administrators)
-
-## Compilation
-
-```bash
-# x64
-x86_64-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x64.o -Wall
-
-# x86
-i686-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x86.o -Wall
-```
 
 ## Installation
 
-1. Place compiled `.o` files, the `.cna` script, and `beacon.h` in the same directory.
-2. In Cobalt Strike: **Script Manager** > **Load** > select `ms16032_inject.cna`.
+### Prerequisites
+
+- Cobalt Strike 4.0+
+- MinGW-w64 cross-compiler
+
+### Compilation
+
+```bash
+# Compile x64 version
+x86_64-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x64.o -masm=intel
+
+# Compile x86 version
+i686-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x86.o -masm=intel
+```
+
+### Loading into Cobalt Strike
+
+1. Place compiled `.o` files alongside `ms16032_inject.cna` and `beacon.h`
+2. In Cobalt Strike: `Script Manager` -> `Load` -> select `ms16032_inject.cna`
 
 ## Usage
 
@@ -57,75 +56,57 @@ i686-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x86.o -Wall
 beacon> ms16032_inject <listener>
 ```
 
-Example:
-
-```
-beacon> ms16032_inject smb_listener
-[*] MS16-032 LPE | CPUs: 4 | Shellcode: 265813 bytes
-[*] Token type index: 5
-[*] Attempt 1/10
-[*] Baseline: 12 token handles — racing...
-[+] SYSTEM token acquired!
-[*] Injecting beacon...
-[+] Sacrificial process PID 4812
-[+] Beacon injected via APC
-[+] Exploit complete — beacon should check in shortly
-```
+Automatically escalates to SYSTEM and injects a new beacon for the specified listener.
 
 ## How It Works
 
-### Exploitation
+### The Vulnerability (CVE-2016-0099)
 
-1. **Pre-flight check**: Verifies 2+ logical processors are available (required for the race).
-2. **Type index resolution**: Opens our own process token and queries the system handle table to learn the kernel's `ObjectTypeIndex` for Token objects on this specific build — avoids hardcoded values that vary across Windows versions.
-3. **Baseline snapshot**: Records all token handles currently in the Beacon process.
-4. **Race condition**: Spawns 10 threads that spam `CreateProcessWithLogonW` with dummy credentials. The race condition in `seclogon.dll` can cause it to leak a SYSTEM token handle back into the calling process.
-5. **Diff snapshot**: Queries token handles again and identifies any **new** handles that appeared during the race.
-6. **Token validation**: Each new token handle is checked for: primary type, S-1-5-18 (SYSTEM) SID, and system-level integrity. Unusable tokens are discarded.
-7. **Clean shutdown**: Race threads are stopped via a manual-reset event and joined with `WaitForMultipleObjects` — no `TerminateThread`.
-8. **Retry**: If no SYSTEM token is found, the cycle repeats (up to 10 attempts). Race conditions are probabilistic.
+The Windows Secondary Logon Service (`seclogon`) runs as SYSTEM and processes `CreateProcessWithLogonW` requests from client processes. When it handles a request, it opens the client process's token to create the new process. A race condition exists: when multiple threads call `CreateProcessWithLogonW` simultaneously, the service can confuse which client it's servicing and assign its own **SYSTEM token** as the primary token of the child process.
 
-### Injection (Early Bird APC)
+### Exploitation Process
 
-1. **Privilege enable**: Best-effort enable of `SeImpersonatePrivilege` on the Beacon's own token (useful for service accounts where the privilege exists but is disabled).
-2. **Process creation**: Spawns `dllhost.exe` as SYSTEM in a suspended state. Tries `CreateProcessWithTokenW` first, falls back to impersonation + `CreateProcessAsUserW`.
-3. **Memory allocation**: Allocates `PAGE_READWRITE` memory in the target process.
-4. **Shellcode write**: Writes beacon shellcode to the allocated region.
-5. **Protection flip**: Changes memory to `PAGE_EXECUTE_READ` via `VirtualProtectEx`.
-6. **APC queue**: Queues a user APC pointing to the shellcode on the suspended main thread.
-7. **Resume**: Resumes the thread. The APC fires during `NtTestAlert` in `LdrInitializeThunk`, before the process entry point — the beacon starts executing as SYSTEM.
+1. **Pre-flight checks**: Verifies 2+ logical CPUs are present (required for the race)
+2. **Race condition**: 10 threads simultaneously spam `CreateProcessWithLogonW` with dummy credentials and `CREATE_SUSPENDED`
+3. **Token inspection**: Each thread opens the suspended child process's token via `OpenProcessToken` and checks if it's SYSTEM (SID `S-1-5-18`)
+4. **Token validation**: Validates the token is a primary token with system-level integrity
+5. **Token capture**: On success, duplicates the SYSTEM token for use
+
+### Injection Process
+
+1. **Process creation**: Spawns `dllhost.exe` as SYSTEM using the captured token (via `CreateProcessWithTokenW` or impersonation fallback)
+2. **Memory allocation**: Allocates RW memory in the target process
+3. **Shellcode write**: Writes beacon shellcode to the allocated memory
+4. **Memory protection**: Flips memory from RW to RX (no RWX)
+5. **APC injection**: Queues a user APC on the suspended thread — executes before the entry point
+6. **Execution**: Resumes the thread, APC fires, beacon starts
 
 ## OPSEC Considerations
 
-### Strengths
-
+### Pros
 - No files written to disk
-- No `CreateRemoteThread` (uses APC injection instead)
-- No RWX memory allocations (RW -> RX)
+- No RWX memory allocations (RW->RX)
+- No `CreateRemoteThread` (uses APC injection)
 - `CREATE_NO_WINDOW` flag on all spawned processes
-- Uses legitimate Windows process (`dllhost.exe`) as injection target
-- BOF format — runs inline in Beacon, minimal footprint
-- Clean thread lifecycle — no `TerminateThread`, no leaked state
+- BOF runs in-process (no fork & run)
+- Clean thread shutdown via interlocked flags
 
-### Weaknesses
-
-- Multiple suspended `cmd.exe` processes created/terminated during the race (Sysmon Event ID 1)
-- Token handle enumeration via `NtQuerySystemInformation` (Sysmon Event ID 10)
-- APC injection into `dllhost.exe` (behavioral detection)
-- Rapid process creation/termination pattern is anomalous
+### Cons
+- Creates suspended `cmd.exe` processes during the race (process creation events)
+- `OpenProcessToken` calls on child processes
+- Process injection into `dllhost.exe`
+- Multiple rapid `CreateProcessWithLogonW` calls (seclogon activity)
 
 ### Detection Vectors
 
-| Source | Event | What It Catches |
-|--------|-------|-----------------|
-| Sysmon | Event ID 1 | Burst of suspended `cmd.exe` creation/termination |
-| Sysmon | Event ID 10 | `NtQuerySystemInformation` handle enumeration |
-| EDR | Behavioral | Rapid process creation + token manipulation |
-| EDR | Memory | RW->RX transition in remote process |
+- Sysmon Event ID 1: Multiple suspended `cmd.exe` processes in rapid succession
+- Sysmon Event ID 10: `OpenProcessToken` on child processes
+- Sysmon Event ID 1: `dllhost.exe` spawned by an unusual parent
+- ETW: Rapid `CreateProcessWithLogonW` calls to seclogon
 
-### Tuning the Injection Target
+### Evasion Improvements
 
-You can change the sacrificial process in `ms16032_inject.c` (the `target` variable in `InjectBeacon`):
+You can modify the injection target in `ms16032_inject.c`:
 
 ```c
 // Default
@@ -138,43 +119,38 @@ wchar_t target[] = L"C:\\Windows\\System32\\dllhost.exe";
 
 ## Troubleshooting
 
-### "Exploit requires 2+ logical CPUs"
+### "Requires 2+ logical CPUs"
 
-The race condition cannot be won on a single-CPU system. Verify with `systeminfo` or check `NUMBER_OF_PROCESSORS`.
+The race condition only works on multi-processor systems. Single-CPU VMs will always fail.
 
-### "No SYSTEM token after 10 attempts"
+### No SYSTEM token after all attempts
 
-- **System is patched** — check for KB3139914 with `wmic qfe`.
-- **Race didn't trigger** — probabilistic; try running again.
-- **Secondary Logon service not running** — verify with `sc query seclogon`.
-
-### "Cannot spawn SYSTEM process (need SeImpersonatePrivilege)"
-
-The Beacon process lacks `SeImpersonatePrivilege`. This exploit works best from:
-- IIS application pool identities
-- SQL Server service accounts
-- Other service accounts with `SeImpersonatePrivilege`
-- Administrator contexts (elevated)
-
-Run `whoami /priv` to check available privileges.
+- **System is patched**: Check with `systeminfo` for KB3139914
+- **Race didn't trigger**: Run again — race conditions are probabilistic
+- **seclogon not running**: The Secondary Logon service must be running (`sc query seclogon`)
 
 ### Beacon doesn't call back
 
-- Verify listener configuration matches the architecture (x86 vs x64).
-- Check firewall rules — SYSTEM context may have different network access.
-- Try SMB or TCP listeners if HTTP/HTTPS fails from SYSTEM.
+- Verify listener is configured correctly
+- Check firewall rules from SYSTEM context
+- Try SMB or TCP listener
+- Ensure architecture matches (x64 vs x86)
+
+### "Cannot spawn SYSTEM process"
+
+- Need `SeImpersonatePrivilege` — standard for administrator/service contexts
+- If both creation methods fail, try from a different user context
 
 ## Credits
 
 - **Original Research**: James Forshaw ([@tiraniddo](https://twitter.com/tiraniddo)) — Project Zero
-- **PowerShell PoC**: FuzzySecurity
+- **Original PoC**: FuzzySecurity — [Invoke-MS16-032.ps1](https://github.com/FuzzySecurity/PowerShell-Suite/blob/master/Invoke-MS16-032.ps1)
 - **CVE**: CVE-2016-0099
 
 ## References
 
 - [Microsoft Security Bulletin MS16-032](https://docs.microsoft.com/en-us/security-updates/securitybulletins/2016/ms16-032)
 - [CVE-2016-0099](https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2016-0099)
-- [FuzzySecurity Invoke-MS16-032](https://github.com/FuzzySecurity/PowerShell-Suite/blob/master/Invoke-MS16-032.ps1)
 
 ## Legal Disclaimer
 

