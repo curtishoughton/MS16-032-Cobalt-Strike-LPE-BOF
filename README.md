@@ -38,12 +38,22 @@ MS16-032 exploits a race condition in the Windows Secondary Logon Service (`secl
 ### Compilation
 
 ```bash
-# Compile x64 version
-x86_64-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x64.o -masm=intel
+# Build both architectures
+make
 
-# Compile x86 version
+# Or build individually
+make x64
+make x86
+```
+
+Or compile manually (the `-o` flag sets the correct output filename):
+
+```bash
+x86_64-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x64.o -masm=intel
 i686-w64-mingw32-gcc -c ms16032_inject.c -o ms16032_inject.x86.o -masm=intel
 ```
+
+**Important:** The output files must be named `ms16032_inject.x64.o` / `ms16032_inject.x86.o` and placed in the same directory as `ms16032_inject.cna`.
 
 ### Loading into Cobalt Strike
 

